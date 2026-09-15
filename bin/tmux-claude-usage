@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+# Claude Code usage limits, rendered for the tmux status bar.
+set -euo pipefail
+
+API="https://api.anthropic.com/api/oauth/usage"
+CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/tmux-claude-usage/usage.json"
+TTL="${CLAUDE_USAGE_TTL:-60}"  # seconds before the cache is refreshed
+WIDTH=5                        # bar cells
+FILL='▰'
+EMPTY='▱'
+
+# Claude Code keeps its OAuth token in the macOS keychain, or in a plaintext
+# file when no keychain is available.
+token() {
+  local creds="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/.credentials.json"
+  if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
+    printf '%s' "$CLAUDE_CODE_OAUTH_TOKEN"
+  elif [ -r "$creds" ]; then
+    jq -r '.claudeAiOauth.accessToken // empty' "$creds"
+  else
+    security find-generic-password -a "$USER" -s 'Claude Code-credentials' -w 2>/dev/null |
+      jq -r '.claudeAiOauth.accessToken // empty'
+  fi
+}
+
+fetch() {
+  local tok
+  tok="$(token)"
+  [ -n "$tok" ] || return 1
+  mkdir -p "$(dirname "$CACHE")"
+  curl -fsS --max-time 10 "$API" \
+    -H "Authorization: Bearer $tok" \
+    -H 'anthropic-beta: oauth-2025-04-20' \
+    -o "$CACHE.new" || return 1
+  mv "$CACHE.new" "$CACHE"
+}
+
+mtime() { stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null || echo 0; }
+
+color() {
+  if   [ "$1" -ge 85 ]; then echo red
+  elif [ "$1" -ge 60 ]; then echo yellow
+  else echo green
+  fi
+}
+
+segment() { # label percent
+  local pct=$2 filled i bar=''
+  filled=$(( (pct * WIDTH + 99) / 100 ))  # round up so any usage lights a cell
+  [ "$filled" -gt "$WIDTH" ] && filled=$WIDTH
+  for ((i = 0; i < WIDTH; i++)); do
+    [ "$i" -lt "$filled" ] && bar+="$FILL" || bar+="$EMPTY"
+  done
+  printf '#[fg=%s]%s %s %d%%' "$(color "$pct")" "$1" "$bar" "$pct"
+}
+
+render() {
+  local five seven
+  read -r five seven < <(jq -r '
+    [.five_hour.utilization // 0, .seven_day.utilization // 0]
+    | map(round) | @tsv' "$CACHE" 2>/dev/null) || return 0
+  printf '#[fg=default]✳ %s  %s' "$(segment 5h "$five")" "$(segment 7d "$seven")"
+}
+
+status() {
+  if [ $(( $(date +%s) - $(mtime "$CACHE") )) -ge "$TTL" ]; then
+    mkdir -p "$(dirname "$CACHE")"
+    touch "$CACHE"  # claim the refresh so concurrent status calls skip it
+    (fetch >/dev/null 2>&1 &)
+  fi
+  render
+}
+
+case "${1:-status}" in
+  status) status ;;
+  fetch)  fetch && render && echo ;;
+  *) echo "usage: tmux-claude-usage [status|fetch]" >&2; exit 2 ;;
+esac
