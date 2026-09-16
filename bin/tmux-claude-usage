@@ -8,6 +8,9 @@ TTL="${CLAUDE_USAGE_TTL:-60}"  # seconds before the cache is refreshed
 WIDTH=5                        # bar cells
 FILL='▰'
 EMPTY='▱'
+ACCENT=colour209               # the ✳
+MUTED=colour245                # labels, countdown
+FAINT=colour240                # separator
 
 # Claude Code keeps its OAuth token in the macOS keychain, or in a plaintext
 # file when no keychain is available.
@@ -44,6 +47,28 @@ color() {
   fi
 }
 
+# 5-hour percent, 7-day percent, seconds until the 7-day window resets.
+read_usage() {
+  jq -r --argjson now "$(date +%s)" '
+    def pct: (.utilization // 0) | round;
+    def reset: try ((.resets_at // "")
+                    | sub("\\.[0-9]+"; "")
+                    | sub("\\+00:00$"; "Z")
+                    | fromdateiso8601) catch 0;
+    [(.five_hour | pct), (.seven_day | pct), ((.seven_day | reset) - $now)]
+    | @tsv' "$CACHE" 2>/dev/null
+}
+
+countdown() { # seconds
+  local s=$1
+  [ "$s" -gt 0 ] || return 1
+  if [ "$s" -ge 86400 ]; then
+    printf '%dd%dh' "$(( s / 86400 ))" "$(( s % 86400 / 3600 ))"
+  else
+    printf '%dh%02dm' "$(( s / 3600 ))" "$(( s % 3600 / 60 ))"
+  fi
+}
+
 segment() { # label percent
   local pct=$2 filled i bar=''
   filled=$(( (pct * WIDTH + 99) / 100 ))  # round up so any usage lights a cell
@@ -51,15 +76,16 @@ segment() { # label percent
   for ((i = 0; i < WIDTH; i++)); do
     [ "$i" -lt "$filled" ] && bar+="$FILL" || bar+="$EMPTY"
   done
-  printf '#[fg=%s]%s %s %d%%' "$(color "$pct")" "$1" "$bar" "$pct"
+  printf '#[fg=%s]%s #[fg=%s]%s %3d%%' "$MUTED" "$1" "$(color "$pct")" "$bar" "$pct"
 }
 
 render() {
-  local five seven
-  read -r five seven < <(jq -r '
-    [.five_hour.utilization // 0, .seven_day.utilization // 0]
-    | map(round) | @tsv' "$CACHE" 2>/dev/null) || return 0
-  printf '#[fg=default]✳ %s  %s' "$(segment 5h "$five")" "$(segment 7d "$seven")"
+  local five seven left eta
+  read -r five seven left < <(read_usage) || return 0
+  printf '#[fg=%s]✳ %s #[fg=%s]│ %s' \
+    "$ACCENT" "$(segment 5h "$five")" "$FAINT" "$(segment 7d "$seven")"
+  eta="$(countdown "$left")" && printf '#[fg=%s] ↻%s' "$MUTED" "$eta"
+  printf '#[default]'
 }
 
 status() {
