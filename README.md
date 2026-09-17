@@ -3,14 +3,16 @@
 Your Claude Code usage limits, in the tmux status bar.
 
 ```
-✳ 5h ▰▰▰▱▱  58% │ 7d ▰▱▱▱▱  14% ↻3d4h
+✳ 5h ▰▰▰▱▱  58% ↻2h13m │ 7d ▰▱▱▱▱  14% ↻3d04h
 ```
 
 Two gauges: the 5-hour session window and the 7-day window, each coloured green
-→ yellow (60%) → red (85%). `↻` counts down to the weekly reset — days and
-hours, switching to hours and minutes on the final day. Percentages are padded
-to three columns so the segment keeps a fixed width and your status bar never
-jitters.
+→ yellow (60%) → red (85%). `↻` counts down to that window's reset — `2h13m`
+under a day, `3d04h` beyond it. A window that has already lapsed shows no
+countdown, so the `5h` clock appears only while a session is actually open.
+
+Every field is padded, so the segment holds a constant 45 columns and your
+status bar never jitters as the numbers change.
 
 Numbers come from the same `/usage` endpoint Claude Code uses, so they match
 exactly.

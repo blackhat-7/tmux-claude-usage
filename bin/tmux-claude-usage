@@ -47,7 +47,7 @@ color() {
   fi
 }
 
-# 5-hour percent, 7-day percent, seconds until the 7-day window resets.
+# Percent then seconds-until-reset, for the 5-hour and 7-day windows.
 read_usage() {
   jq -r --argjson now "$(date +%s)" '
     def pct: (.utilization // 0) | round;
@@ -55,37 +55,43 @@ read_usage() {
                     | sub("\\.[0-9]+"; "")
                     | sub("\\+00:00$"; "Z")
                     | fromdateiso8601) catch 0;
-    [(.five_hour | pct), (.seven_day | pct), ((.seven_day | reset) - $now)]
+    [(.five_hour | pct), (.seven_day | pct),
+     ((.five_hour | reset) - $now), ((.seven_day | reset) - $now)]
     | @tsv' "$CACHE" 2>/dev/null
 }
 
+# Always five columns, so a segment keeps its width as the clock runs down.
 countdown() { # seconds
   local s=$1
   [ "$s" -gt 0 ] || return 1
   if [ "$s" -ge 86400 ]; then
-    printf '%dd%dh' "$(( s / 86400 ))" "$(( s % 86400 / 3600 ))"
+    printf '%dd%02dh' "$(( s / 86400 ))" "$(( s % 86400 / 3600 ))"
   else
     printf '%dh%02dm' "$(( s / 3600 ))" "$(( s % 3600 / 60 ))"
   fi
 }
 
-segment() { # label percent
-  local pct=$2 filled i bar=''
+segment() { # label percent seconds-until-reset
+  local pct=$2 filled i bar='' eta
   filled=$(( (pct * WIDTH + 99) / 100 ))  # round up so any usage lights a cell
   [ "$filled" -gt "$WIDTH" ] && filled=$WIDTH
   for ((i = 0; i < WIDTH; i++)); do
     [ "$i" -lt "$filled" ] && bar+="$FILL" || bar+="$EMPTY"
   done
   printf '#[fg=%s]%s #[fg=%s]%s %3d%%' "$MUTED" "$1" "$(color "$pct")" "$bar" "$pct"
+  # A window that has already lapsed has nothing left to count down.
+  if eta="$(countdown "$3")"; then
+    printf '#[fg=%s] ↻%s' "$MUTED" "$eta"
+  fi
 }
 
 render() {
-  local five seven left eta
-  read -r five seven left < <(read_usage) || return 0
-  printf '#[fg=%s]✳ %s #[fg=%s]│ %s' \
-    "$ACCENT" "$(segment 5h "$five")" "$FAINT" "$(segment 7d "$seven")"
-  eta="$(countdown "$left")" && printf '#[fg=%s] ↻%s' "$MUTED" "$eta"
-  printf '#[default]'
+  local five seven five_in seven_in
+  read -r five seven five_in seven_in < <(read_usage) || return 0
+  # fg=default, not default: the caller's background stays intact.
+  printf '#[fg=%s]✳ %s #[fg=%s]│ %s#[fg=default]' \
+    "$ACCENT" "$(segment 5h "$five" "$five_in")" \
+    "$FAINT"  "$(segment 7d "$seven" "$seven_in")"
 }
 
 status() {
