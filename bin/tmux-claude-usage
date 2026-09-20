@@ -38,7 +38,10 @@ fetch() {
   mv "$CACHE.new" "$CACHE"
 }
 
-mtime() { stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null || echo 0; }
+# GNU stat reads `-f %m` as a filename and still prints the filesystem block
+# for the real file, so the GNU form has to be tried first; BSD stat has no
+# -c and fails cleanly.
+mtime() { stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || echo 0; }
 
 color() {
   if   [ "$1" -ge 85 ]; then echo red
