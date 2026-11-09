@@ -85,10 +85,10 @@ today and over 7 days, 30 days and all time, with a 14-day sparkline:
 ```
   ⌂ LOCAL MODEL SAVINGS         at Claude API prices
 
-  38% cheaper than all-Claude, all time  ·  86 subagents ran locally
+  3.8% cheaper than all-Claude, all time  ·  86 subagents ran locally
 
             % saved             saved       paid
-  today     ━━━━╸─────   38%    $1.53      $2.44
+  today     ━╸────────  12%    $1.53     $11.20
   ...
 ```
 
@@ -96,12 +96,17 @@ It reads Claude Code's transcripts (`~/.claude/projects`) and counts sessions
 whose main agent ran on Claude. Each subagent that ran on a non-Claude model is
 priced at Claude API list prices as the model it was asked for (`haiku`,
 `sonnet`, ...), or the main agent's model when it named none. "On Claude" is
-"Paid" is what those sessions spent on Claude models, and "% saved" is saved out
-of saved plus paid: how much less the work cost than if Claude had done all of
-it. These are API-price estimates, not your subscription's bill.
+"Paid" is everything Claude models cost across all your sessions, and "% saved"
+is saved out of saved plus paid: how much less all your Claude Code work cost
+than if Claude had done every part of it. These are API-price estimates, not
+your subscription's bill. Each machine reads only its own transcripts.
+
+The first run reads every transcript (seconds for a few GB); later runs read
+only transcripts that changed and take about a second. Results are cached in
+`~/.cache/tmux-claude-usage/`.
 
 `#{@claude-usage-savings}` (or `tmux-claude-usage savings-status`) puts the last
-7 days' percentage in the status bar, `⌂ 38% saved 7d`. It reads a cache refreshed in
+7 days' percentage in the status bar, `⌂ 3.8% saved 7d`. It reads a cache refreshed in
 the background every `CLAUDE_USAGE_SAVINGS_TTL` seconds (default `300`), and
 stays empty until a local subagent has saved something.
 

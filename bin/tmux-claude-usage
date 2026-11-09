@@ -7,6 +7,7 @@ CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/tmux-claude-usage/usage.json"
 TTL="${CLAUDE_USAGE_TTL:-60}"  # seconds before the cache is refreshed
 SAVED="$(dirname "$CACHE")/savings.tsv"
 SAVED_TTL="${CLAUDE_USAGE_SAVINGS_TTL:-300}"
+RECS="$(dirname "$CACHE")/records.jsonl"  # usage records read from transcripts
 WIDTH=10                       # gauge cells, each split in half
 HEAT='114 114 150 150 186 221 221 215 209 203'  # 256-colour ramp along a usage gauge
 LEAF='22 28 28 34 34 40 70 76 112 114'          # and along a savings gauge
@@ -120,78 +121,98 @@ status() {
   render
 }
 
-# What subagents that ran on a local (non-Claude) model would have cost on
-# Claude, read from Claude Code's transcripts. Counts sessions whose main agent
-# ran on Claude; each local subagent is priced as the Claude model it was asked
-# for, or the main agent's model when it named none, since that is where it
-# would otherwise have run.
-# Prints R (range) and D (day) rows for render_savings and savings_status, or
-# nothing when no subagent has run on a local model.
+# Usage records from every Claude Code transcript, one compact line per reply:
+# [file, message id, epoch seconds, model, input, cache write, of which 1h, cache read,
+# output]. Only transcripts changed since the last run are read again, so a
+# refresh costs a fraction of a second after the first.
+refresh_records() {
+  local root="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects" changed
+  mkdir -p "$(dirname "$RECS")"
+  touch "$RECS.next"  # files written during this scan get read again next time
+  if [ -s "$RECS" ] && [ -f "$RECS.stamp" ]; then
+    changed=$(find "$root" -name '*.jsonl' -newer "$RECS.stamp" 2>/dev/null)
+  else
+    changed=$(find "$root" -name '*.jsonl' 2>/dev/null)
+    : > "$RECS"
+  fi
+  if [ -n "$changed" ]; then
+    { # Keep the records of unchanged files, then read the changed ones afresh.
+      awk -F '"' 'NR == FNR { skip[$0]; next } !($2 in skip)' <(printf '%s\n' "$changed") "$RECS"
+      printf '%s\n' "$changed" | tr '\n' '\0' | xargs -0 grep -aH '"type":"assistant"' |
+        jq -cR 'capture("^(?<f>[^:]*):(?<j>.*)$") | .f as $f | .j | fromjson?
+          | select(.message.usage and .timestamp and .message.model != "<synthetic>")
+          | .message.usage as $u
+          | [$f, .message.id, (.timestamp | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601),
+             .message.model, ($u.input_tokens // 0),
+             ($u.cache_creation_input_tokens // 0), ($u.cache_creation.ephemeral_1h_input_tokens // 0),
+             ($u.cache_read_input_tokens // 0), ($u.output_tokens // 0)]' |
+        # A streamed reply is logged once per content block, each with the
+        # same usage; keep the last line of each run.
+        awk -F '"' 'NR > 1 && ($2 != f || $4 != id) { print prev } { prev = $0; f = $2; id = $4 } END { if (NR) print prev }'
+    } > "$RECS.tmp" && mv "$RECS.tmp" "$RECS"
+  fi
+  mv "$RECS.next" "$RECS.stamp"
+}
+
+# R (range) and D (day) rows for render_savings and savings_status. "Saved" is
+# what subagents that ran on a local (non-Claude) model would have cost on
+# Claude, in sessions whose main agent ran on Claude: each is priced as the
+# model it was asked for, or the main agent's model when it named none, since
+# that is where it would otherwise have run. "Spent" is every reply from a
+# Claude model, across all sessions.
 savings_rows() {
-  local root="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects" now today subs aliases
-  # ERE has no lookahead: a "model" value that does not start with claude- or <synthetic>.
-  local not_claude='"model":"([^c<"]|c[^l]|cl[^a]|cla[^u]|clau[^d]|claud[^e]|claude[^-])'
+  local root="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects" now today aliases
   now=$(date +%s)
   today=$(( now - 10#$(date +%H) * 3600 - 10#$(date +%M) * 60 - 10#$(date +%S) ))
+  refresh_records
+  # The model each subagent was asked for, keyed by its transcript.
+  aliases=$(find "$root" -path '*/subagents/*.meta.json' -print0 2>/dev/null |
+    xargs -0 jq -c '{(input_filename | sub("\\.meta\\.json$"; ".jsonl")): (.model // "inherit")}' 2>/dev/null |
+    jq -sc 'add // {}')
+  jq -rs --argjson aliases "$aliases" --argjson now "$now" --argjson today "$today" '
+    # USD per million tokens, Claude API list prices (2026-11). Cache writes
+    # cost 1.25x input for 5 minutes and 2x for an hour; local servers report
+    # no TTL, so their writes count at the cheaper 5-minute rate.
+    def rates: if test("haiku") then [0.1, 0.5, 0.01]
+               elif test("sonnet") then [2, 10, 0.2]
+               elif test("fable|mythos") then [10, 50, 0.25]
+               else [4, 20, 0.2] end;
+    def cost($m): ($m | rates) as [$in, $out, $read]
+      | . as [$f, $id, $ts, $model, $i, $cw, $h, $cr, $o]
+      | ($i * $in + ($cw - $h) * $in * 1.25 + $h * $in * 2 + $cr * $read + $o * $out) / 1e6;
+    def claude: test("^claude-");
+    def session: sub("/subagents/.*"; "") | sub("\\.jsonl$"; "");
+    def day: strflocaltime("%b %d");
 
-  subs=$(find "$root" -path '*/subagents/*.jsonl' -print0 2>/dev/null |
-    xargs -0 grep -lE "$not_claude" 2>/dev/null || true)
-  [ -n "$subs" ] || return 0
-
-  # The model each subagent was asked for, from its .meta.json.
-  aliases=$(while IFS= read -r f; do
-    jq -c --arg f "$f" '{($f): (.model // "inherit")}' "${f%.jsonl}.meta.json" 2>/dev/null ||
-      jq -nc --arg f "$f" '{($f): "inherit"}'
-  done <<< "$subs" | jq -sc 'add')
-
-  # Those subagent transcripts plus their sessions' main transcripts.
-  { printf '%s\n' "$subs"; printf '%s\n' "$subs" | sed 's|/subagents/.*|.jsonl|' | sort -u; } |
-    tr '\n' '\0' | xargs -0 jq -cR 'fromjson? | select(.type == "assistant" and .message.usage and .message.model and .timestamp)
-      | {f: input_filename, id: .message.id, ts: .timestamp, model: .message.model, u: .message.usage}' 2>/dev/null |
-    jq -rs --argjson aliases "$aliases" --argjson now "$now" --argjson today "$today" '
-      # USD per million tokens, Claude API list prices (2026-11). Cache writes
-      # cost 1.25x input for 5 minutes and 2x for an hour; local servers report
-      # no TTL, so their writes count at the cheaper 5-minute rate.
-      def rates: if test("haiku") then [0.1, 0.5, 0.01]
-                 elif test("sonnet") then [2, 10, 0.2]
-                 elif test("fable|mythos") then [10, 50, 0.25]
-                 else [4, 20, 0.2] end;
-      def cost($m): ($m | rates) as [$in, $out, $read]
-        | (.cache_creation.ephemeral_1h_input_tokens // 0) as $h
-        | ((.input_tokens // 0) * $in + ((.cache_creation_input_tokens // 0) - $h) * $in * 1.25
-           + $h * $in * 2 + (.cache_read_input_tokens // 0) * $read + (.output_tokens // 0) * $out) / 1e6;
-      def claude: test("^claude-");
-      def session: sub("/subagents/.*"; "") | sub("\\.jsonl$"; "");
-      def epoch: sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601;
-      def day: strflocaltime("%b %d");
-
-      # Streamed replies are logged once per content block with the same usage; keep one.
-      (group_by([.f, .id]) | map(last)) as $recs
-      | ($recs | map(select((.f | test("/subagents/") | not) and (.model | claude)))
-               | map({key: (.f | session), value: .model}) | from_entries) as $main
-      | [$recs[] | (.f | session) as $s | select($main[$s])
-         | {t: (.ts | epoch), f}
-           + if (.model | claude) then {spent: (.model as $m | .u | cost($m)), saved: 0}
-             else ($aliases[.f] // "inherit") as $a
-               | {saved: (.u | cost(if $a == "inherit" then $main[$s] else $a end)), spent: 0, local: true}
-             end] as $rows
-      | ((["Today", $today], ["7 days", $now - 7 * 86400], ["30 days", $now - 30 * 86400], ["All time", 0])
-         as [$label, $from]
-         | [$rows[] | select(.t >= $from)] as $r
-         | ["R", $label, ($r | map(.saved) | add // 0), ($r | map(.spent) | add // 0),
-            ($r | map(select(.local) | .f) | unique | length)] | @tsv),
-        ([range(13; -1; -1) | $now - . * 86400 | day] as $days
-         | ($rows | map(select(.local)) | group_by(.t | day)
-            | map({key: (.[0].t | day), value: (map(.saved) | add)}) | from_entries) as $by
-         | ([$days[] | $by[.] // 0] | max) as $max
-         | $days[] | ["D", ., ($by[.] // 0), (if $max > 0 then (($by[.] // 0) / $max * 8 | ceil) else 0 end)]
-         | @tsv)'
+    . as $recs
+    # A session runs on Claude when most replies in its main transcript do.
+    | ($recs | map(select(.[0] | test("/subagents/") | not)) | group_by(.[0])
+       | map((group_by(.[3]) | max_by(length) | .[0][3]) as $m
+             | select($m | claude) | {key: (.[0][0] | session), value: $m}) | from_entries) as $main
+    | [$recs[] | .[0] as $f | (.[3] | claude) as $c | ($f | session) as $s
+       | select($c or (($f | test("/subagents/")) and $main[$s]))
+       | {t: .[2], f: $f}
+         + if $c then {spent: cost(.[3]), saved: 0}
+           else ($aliases[$f] // "inherit") as $a
+             | {saved: cost(if $a == "inherit" then $main[$s] else $a end), spent: 0, local: true}
+           end] as $rows
+    | ((["Today", $today], ["7 days", $now - 7 * 86400], ["30 days", $now - 30 * 86400], ["All time", 0])
+       as [$label, $from]
+       | [$rows[] | select(.t >= $from)] as $r
+       | ["R", $label, ($r | map(.saved) | add // 0), ($r | map(.spent) | add // 0),
+          ($r | map(select(.local) | .f) | unique | length)] | @tsv),
+      ([range(13; -1; -1) | $now - . * 86400 | day] as $days
+       | ($rows | map(select(.local)) | group_by(.t | day)
+          | map({key: (.[0].t | day), value: (map(.saved) | add)}) | from_entries) as $by
+       | ([$days[] | $by[.] // 0] | max) as $max
+       | $days[] | ["D", ., ($by[.] // 0), (if $max > 0 then (($by[.] // 0) / $max * 8 | ceil) else 0 end)]
+       | @tsv)' "$RECS"
 }
 
 savings() {
   local rows
   rows=$(savings_rows)
-  if [ -z "$rows" ]; then
+  if ! awk -F '\t' '$2 == "All time" && $3 > 0 { found = 1 } END { exit !found }' <<< "$rows"; then
     printf '\n  No subagents have run on a local model yet.\n\n'
     return 0
   fi
@@ -212,7 +233,7 @@ savings_status() {
   awk -F '\t' -v accent="$ACCENT" -v muted="$MUTED" '
     $1 == "R" && $2 == "7 days" { week = ($3 + $4 > 0) ? 100 * $3 / ($3 + $4) : 0 }
     $1 == "R" && $2 == "All time" && $3 > 0 {
-      printf "#[fg=colour%s]⌂ #[fg=colour114,bold]%d%%#[nobold]#[fg=colour%s] saved 7d#[fg=default]", accent, week, muted
+      printf "#[fg=colour%s]⌂ #[fg=colour114,bold]" (week < 10 ? "%.1f" : "%d") "%%#[nobold]#[fg=colour%s] saved 7d#[fg=default]", accent, week, muted
     }' "$SAVED" 2>/dev/null || true
 }
 
@@ -237,15 +258,16 @@ render_savings() {
     "$(c "$ACCENT")" "$b" "$r" 9 '' "$(c "$MUTED")" "$r"
   # Percent saved: what local subagents saved, out of what the same work would
   # have cost with Claude doing all of it.
-  pct() { awk -v s="$1" -v p="$2" 'BEGIN { printf "%d", (s + p > 0) ? 100 * s / (s + p) : 0 }'; }
-  printf '  %s%s%d%% cheaper%s %sthan all-Claude, all time  ·  %s subagents ran locally%s\n\n' \
+  # One decimal below 10%, so a small saving does not read as zero.
+  pct() { awk -v s="$1" -v p="$2" 'BEGIN { x = (s + p > 0) ? 100 * s / (s + p) : 0; printf (x < 10 ? "%.1f" : "%d"), x }'; }
+  printf '  %s%s%s%% cheaper%s %sthan all-Claude, all time  ·  %s subagents ran locally%s\n\n' \
     "$b" "$(c 114)" "$(pct "${saveds[3]}" "${spents[3]}")" "$r" "$(c "$MUTED")" "${counts[3]}" "$r"
 
   printf '  %s%-10s%-16s%9s%11s%s\n' "$(c "$MUTED")" '' '% saved' saved paid "$r"
   for i in 0 1 2 3; do
     share=$(pct "${saveds[i]}" "${spents[i]}")
-    printf '  %-10s%s %s%s%4d%%%s%s%9s%s%11s\n' "$(echo "${labels[i]}" | tr A-Z a-z)" \
-      "$(gauge "$share" "$LEAF" "$fg")" "$b" "$(c 114)" "$share" "$r" "$(c 114)" \
+    printf '  %-10s%s %s%s%5s%%%s%s%9s%s%11s\n' "$(echo "${labels[i]}" | tr A-Z a-z)" \
+      "$(gauge "${share%.*}" "$LEAF" "$fg")" "$b" "$(c 114)" "$share" "$r" "$(c 114)" \
       "$(printf '$%.2f' "${saveds[i]}")" "$r" "$(printf '$%.2f' "${spents[i]}")"
   done
 
