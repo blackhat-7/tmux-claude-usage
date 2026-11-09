@@ -99,7 +99,12 @@ priced at Claude API list prices as the model it was asked for (`haiku`,
 what those sessions spent on Claude models. These are API-price estimates, not
 your subscription's bill.
 
-To open it in a popup, pick a key before the plugin loads:
+`#{@claude-usage-savings}` (or `tmux-claude-usage savings-status`) puts today's
+figure in the status bar, `⚡ $1.53 saved today`. It reads a cache refreshed in
+the background every `CLAUDE_USAGE_SAVINGS_TTL` seconds (default `300`), and
+stays empty until a local subagent has saved something.
+
+To open the full report in a popup, pick a key before the plugin loads:
 
 ```tmux
 set -g @claude-usage-savings-key u   # prefix + u

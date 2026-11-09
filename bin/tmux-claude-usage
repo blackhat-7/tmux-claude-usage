@@ -5,6 +5,8 @@ set -euo pipefail
 API="https://api.anthropic.com/api/oauth/usage"
 CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/tmux-claude-usage/usage.json"
 TTL="${CLAUDE_USAGE_TTL:-60}"  # seconds before the cache is refreshed
+SAVED="$(dirname "$CACHE")/savings.tsv"
+SAVED_TTL="${CLAUDE_USAGE_SAVINGS_TTL:-300}"
 WIDTH=10                       # gauge cells, each split in half
 HEAT='114 114 150 150 186 221 221 215 209 203'  # 256-colour ramp along a usage gauge
 LEAF='22 28 28 34 34 40 70 76 112 114'          # and along a savings gauge
@@ -123,7 +125,9 @@ status() {
 # ran on Claude; each local subagent is priced as the Claude model it was asked
 # for, or the main agent's model when it named none, since that is where it
 # would otherwise have run.
-savings() {
+# Prints R (range) and D (day) rows for render_savings and savings_status, or
+# nothing when no subagent has run on a local model.
+savings_rows() {
   local root="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects" now today subs aliases
   # ERE has no lookahead: a "model" value that does not start with claude- or <synthetic>.
   local not_claude='"model":"([^c<"]|c[^l]|cl[^a]|cla[^u]|clau[^d]|claud[^e]|claude[^-])'
@@ -132,10 +136,7 @@ savings() {
 
   subs=$(find "$root" -path '*/subagents/*.jsonl' -print0 2>/dev/null |
     xargs -0 grep -lE "$not_claude" 2>/dev/null || true)
-  if [ -z "$subs" ]; then
-    printf '\n  No subagents have run on a local model yet.\n\n'
-    return 0
-  fi
+  [ -n "$subs" ] || return 0
 
   # The model each subagent was asked for, from its .meta.json.
   aliases=$(while IFS= read -r f; do
@@ -184,7 +185,34 @@ savings() {
             | map({key: (.[0].t | day), value: (map(.saved) | add)}) | from_entries) as $by
          | ([$days[] | $by[.] // 0] | max) as $max
          | $days[] | ["D", ., ($by[.] // 0), (if $max > 0 then (($by[.] // 0) / $max * 8 | ceil) else 0 end)]
-         | @tsv)' | render_savings
+         | @tsv)'
+}
+
+savings() {
+  local rows
+  rows=$(savings_rows)
+  if [ -z "$rows" ]; then
+    printf '\n  No subagents have run on a local model yet.\n\n'
+    return 0
+  fi
+  mkdir -p "$(dirname "$SAVED")"
+  printf '%s\n' "$rows" > "$SAVED"
+  render_savings <<< "$rows"
+}
+
+# Today's savings for the status bar, from a cache refreshed in the background
+# (the scan takes seconds). Empty until a local subagent has saved something.
+savings_status() {
+  if [ $(( $(date +%s) - $(mtime "$SAVED") )) -ge "$SAVED_TTL" ]; then
+    mkdir -p "$(dirname "$SAVED")"
+    touch "$SAVED"  # claim the refresh so concurrent status calls skip it
+    ( (savings_rows > "$SAVED.new" && mv "$SAVED.new" "$SAVED") >/dev/null 2>&1 &)
+  fi
+  awk -F '\t' -v accent="$ACCENT" -v muted="$MUTED" '
+    $1 == "R" && $2 == "Today" { today = $3 }
+    $1 == "R" && $2 == "All time" && $3 > 0 {
+      printf "#[fg=colour%s]⚡ #[fg=colour114,bold]$%.2f#[nobold]#[fg=colour%s] saved today#[fg=default]", accent, today, muted
+    }' "$SAVED" 2>/dev/null || true
 }
 
 # Rows from savings: R label saved spent subagents, then D day saved level,
@@ -233,5 +261,6 @@ case "${1:-status}" in
   status)  status ;;
   fetch)   fetch && render && echo ;;
   savings) savings ;;
-  *) echo "usage: tmux-claude-usage [status|fetch|savings]" >&2; exit 2 ;;
+  savings-status) savings_status ;;
+  *) echo "usage: tmux-claude-usage [status|fetch|savings|savings-status]" >&2; exit 2 ;;
 esac
