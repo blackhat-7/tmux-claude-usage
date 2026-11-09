@@ -83,12 +83,12 @@ proxy that sends non-Claude model names to llama.cpp or Ollama),
 today and over 7 days, 30 days and all time, with a 14-day sparkline:
 
 ```
-  ⚡ LOCAL MODEL SAVINGS         at Claude API prices
+  ⌂ LOCAL MODEL SAVINGS         at Claude API prices
 
-  $12.40 saved all time  ·  86 subagents ran locally
+  38% cheaper than all-Claude, all time  ·  86 subagents ran locally
 
-               saved   on Claude   local share
-  today        $1.53       $2.44   ━━━━╸─────  38%
+            % saved             saved       paid
+  today     ━━━━╸─────   38%    $1.53      $2.44
   ...
 ```
 
@@ -96,11 +96,12 @@ It reads Claude Code's transcripts (`~/.claude/projects`) and counts sessions
 whose main agent ran on Claude. Each subagent that ran on a non-Claude model is
 priced at Claude API list prices as the model it was asked for (`haiku`,
 `sonnet`, ...), or the main agent's model when it named none. "On Claude" is
-what those sessions spent on Claude models. These are API-price estimates, not
-your subscription's bill.
+"Paid" is what those sessions spent on Claude models, and "% saved" is saved out
+of saved plus paid: how much less the work cost than if Claude had done all of
+it. These are API-price estimates, not your subscription's bill.
 
-`#{@claude-usage-savings}` (or `tmux-claude-usage savings-status`) puts today's
-figure in the status bar, `⚡ $1.53 saved today`. It reads a cache refreshed in
+`#{@claude-usage-savings}` (or `tmux-claude-usage savings-status`) puts the last
+7 days' percentage in the status bar, `⌂ 38% saved 7d`. It reads a cache refreshed in
 the background every `CLAUDE_USAGE_SAVINGS_TTL` seconds (default `300`), and
 stays empty until a local subagent has saved something.
 

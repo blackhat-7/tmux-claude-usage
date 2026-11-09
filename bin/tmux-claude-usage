@@ -208,10 +208,11 @@ savings_status() {
     touch "$SAVED"  # claim the refresh so concurrent status calls skip it
     ( (savings_rows > "$SAVED.new" && mv "$SAVED.new" "$SAVED") >/dev/null 2>&1 &)
   fi
+  # The share of the bill avoided: saved / (saved + spent on Claude), last 7 days.
   awk -F '\t' -v accent="$ACCENT" -v muted="$MUTED" '
-    $1 == "R" && $2 == "Today" { today = $3 }
+    $1 == "R" && $2 == "7 days" { week = ($3 + $4 > 0) ? 100 * $3 / ($3 + $4) : 0 }
     $1 == "R" && $2 == "All time" && $3 > 0 {
-      printf "#[fg=colour%s]⚡ #[fg=colour114,bold]$%.2f#[nobold]#[fg=colour%s] saved today#[fg=default]", accent, today, muted
+      printf "#[fg=colour%s]⌂ #[fg=colour114,bold]%d%%#[nobold]#[fg=colour%s] saved 7d#[fg=default]", accent, week, muted
     }' "$SAVED" 2>/dev/null || true
 }
 
@@ -232,17 +233,20 @@ render_savings() {
   done
   c() { printf "$fg" "$1"; }
 
-  printf '\n  %s⚡ %sLOCAL MODEL SAVINGS%s%*s%sat Claude API prices%s\n\n' \
+  printf '\n  %s⌂ %sLOCAL MODEL SAVINGS%s%*s%sat Claude API prices%s\n\n' \
     "$(c "$ACCENT")" "$b" "$r" 9 '' "$(c "$MUTED")" "$r"
-  printf '  %s%s$%.2f%s %ssaved all time  ·  %s subagents ran locally%s\n\n' \
-    "$b" "$(c 114)" "${saveds[3]}" "$r" "$(c "$MUTED")" "${counts[3]}" "$r"
+  # Percent saved: what local subagents saved, out of what the same work would
+  # have cost with Claude doing all of it.
+  pct() { awk -v s="$1" -v p="$2" 'BEGIN { printf "%d", (s + p > 0) ? 100 * s / (s + p) : 0 }'; }
+  printf '  %s%s%d%% cheaper%s %sthan all-Claude, all time  ·  %s subagents ran locally%s\n\n' \
+    "$b" "$(c 114)" "$(pct "${saveds[3]}" "${spents[3]}")" "$r" "$(c "$MUTED")" "${counts[3]}" "$r"
 
-  printf '  %s%-10s%8s%12s   %s%s\n' "$(c "$MUTED")" '' saved 'on Claude' 'local share' "$r"
+  printf '  %s%-10s%-16s%9s%11s%s\n' "$(c "$MUTED")" '' '% saved' saved paid "$r"
   for i in 0 1 2 3; do
-    share=$(awk -v s="${saveds[i]}" -v p="${spents[i]}" 'BEGIN { printf "%d", (s + p > 0) ? 100 * s / (s + p) : 0 }')
-    printf '  %-10s%s%s%8s%s%12s   %s %s%3d%%%s\n' "$(echo "${labels[i]}" | tr A-Z a-z)" \
-      "$b" "$(c 114)" "$(printf '$%.2f' "${saveds[i]}")" "$r" "$(printf '$%.2f' "${spents[i]}")" \
-      "$(gauge "$share" "$LEAF" "$fg")" "$(c "$MUTED")" "$share" "$r"
+    share=$(pct "${saveds[i]}" "${spents[i]}")
+    printf '  %-10s%s %s%s%4d%%%s%s%9s%s%11s\n' "$(echo "${labels[i]}" | tr A-Z a-z)" \
+      "$(gauge "$share" "$LEAF" "$fg")" "$b" "$(c 114)" "$share" "$r" "$(c 114)" \
+      "$(printf '$%.2f' "${saveds[i]}")" "$r" "$(printf '$%.2f' "${spents[i]}")"
   done
 
   for i in "${!levels[@]}"; do
