@@ -3,15 +3,17 @@
 Your Claude Code usage limits, in the tmux status bar.
 
 ```
-✳ 5h ▰▰▰▱▱  58% ↻2h13m │ 7d ▰▱▱▱▱  14% ↻3d04h
+✳ 5h ━━━━━╸──── 58% ↻2h13m · 7d ━╸──────── 14% ↻3d04h
 ```
 
-Two gauges: the 5-hour session window and the 7-day window, each coloured green
-→ yellow (60%) → red (85%). `↻` counts down to that window's reset — `2h13m`
-under a day, `3d04h` beyond it. A window that has already lapsed shows no
-countdown, so the `5h` clock appears only while a session is actually open.
+Two gauges: the 5-hour session window and the 7-day window. Each is a line that
+fills in half-cell steps and heats from green to red along its length; the
+percentage turns yellow at 60% and red at 85%. `↻` counts down to that window's
+reset — `2h13m` under a day, `3d04h` beyond it. A window that has already lapsed
+shows no countdown, so the `5h` clock appears only while a session is actually
+open.
 
-Every field is padded, so the segment holds a constant 45 columns and your
+Every field is padded, so the segment holds a constant 55 columns and your
 status bar never jitters as the numbers change.
 
 Numbers come from the same `/usage` endpoint Claude Code uses, so they match
@@ -72,6 +74,36 @@ set -g status-right "#(tmux-claude-usage status) #h"
 | Variable            | Default | Meaning                    |
 | ------------------- | ------- | -------------------------- |
 | `CLAUDE_USAGE_TTL`  | `60`    | Cache lifetime, in seconds |
+
+## Local model savings (optional)
+
+If you route some Claude Code subagents to a local model (for example with a
+proxy that sends non-Claude model names to llama.cpp or Ollama),
+`tmux-claude-usage savings` shows what that work would have cost on Claude,
+today and over 7 days, 30 days and all time, with a 14-day sparkline:
+
+```
+  ⚡ LOCAL MODEL SAVINGS         at Claude API prices
+
+  $12.40 saved all time  ·  86 subagents ran locally
+
+               saved   on Claude   local share
+  today        $1.53       $2.44   ━━━━╸─────  38%
+  ...
+```
+
+It reads Claude Code's transcripts (`~/.claude/projects`) and counts sessions
+whose main agent ran on Claude. Each subagent that ran on a non-Claude model is
+priced at Claude API list prices as the model it was asked for (`haiku`,
+`sonnet`, ...), or the main agent's model when it named none. "On Claude" is
+what those sessions spent on Claude models. These are API-price estimates, not
+your subscription's bill.
+
+To open it in a popup, pick a key before the plugin loads:
+
+```tmux
+set -g @claude-usage-savings-key u   # prefix + u
+```
 
 ## License
 

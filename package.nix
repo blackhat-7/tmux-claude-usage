@@ -5,6 +5,10 @@
   bash,
   coreutils,
   curl,
+  findutils,
+  gawk,
+  gnugrep,
+  gnused,
   jq,
   tmuxPlugins,
 }:
@@ -15,6 +19,10 @@ let
     bash
     coreutils
     curl
+    findutils
+    gawk
+    gnugrep
+    gnused
     jq
   ];
 in

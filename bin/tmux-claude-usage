@@ -5,12 +5,12 @@ set -euo pipefail
 API="https://api.anthropic.com/api/oauth/usage"
 CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/tmux-claude-usage/usage.json"
 TTL="${CLAUDE_USAGE_TTL:-60}"  # seconds before the cache is refreshed
-WIDTH=5                        # bar cells
-FILL='▰'
-EMPTY='▱'
-ACCENT=colour209               # the ✳
-MUTED=colour245                # labels, countdown
-FAINT=colour240                # separator
+WIDTH=10                       # gauge cells, each split in half
+HEAT='114 114 150 150 186 221 221 215 209 203'  # 256-colour ramp along a usage gauge
+LEAF='22 28 28 34 34 40 70 76 112 114'          # and along a savings gauge
+ACCENT=209                     # the ✳
+MUTED=245                      # labels, countdown
+FAINT=240                      # empty gauge, separators
 
 # Claude Code keeps its OAuth token in the macOS keychain, or in a plaintext
 # file when no keychain is available.
@@ -44,10 +44,26 @@ fetch() {
 mtime() { stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || echo 0; }
 
 color() {
-  if   [ "$1" -ge 85 ]; then echo red
-  elif [ "$1" -ge 60 ]; then echo yellow
-  else echo green
+  if   [ "$1" -ge 85 ]; then echo 203
+  elif [ "$1" -ge 60 ]; then echo 221
+  else echo 114
   fi
+}
+
+# A WIDTH-cell line gauge in half-cell steps, each lit cell coloured by its
+# place on the ramp. $3 is a printf format that turns a colour number into
+# markup: tmux's for the status bar, ANSI for a terminal.
+gauge() { # percent ramp colour-format
+  local halves=$(( ($1 * WIDTH * 2 + 99) / 100 )) i out='' ramp
+  read -r -a ramp <<< "$2"
+  [ "$halves" -gt $(( WIDTH * 2 )) ] && halves=$(( WIDTH * 2 ))
+  for ((i = 0; i < WIDTH; i++)); do
+    if   [ "$halves" -ge $(( i * 2 + 2 )) ]; then out+="$(printf "$3" "${ramp[i]}")━"
+    elif [ "$halves" -eq $(( i * 2 + 1 )) ]; then out+="$(printf "$3" "${ramp[i]}")╸"
+    else out+="$(printf "$3" "$FAINT")─"
+    fi
+  done
+  printf '%s' "$out"
 }
 
 # Percent then seconds-until-reset, for the 5-hour and 7-day windows.
@@ -75,16 +91,12 @@ countdown() { # seconds
 }
 
 segment() { # label percent seconds-until-reset
-  local pct=$2 filled i bar='' eta
-  filled=$(( (pct * WIDTH + 99) / 100 ))  # round up so any usage lights a cell
-  [ "$filled" -gt "$WIDTH" ] && filled=$WIDTH
-  for ((i = 0; i < WIDTH; i++)); do
-    [ "$i" -lt "$filled" ] && bar+="$FILL" || bar+="$EMPTY"
-  done
-  printf '#[fg=%s]%s #[fg=%s]%s %3d%%' "$MUTED" "$1" "$(color "$pct")" "$bar" "$pct"
+  local pct=$2 eta
+  printf '#[fg=colour%s]%s %s #[fg=colour%s,bold]%3d%%#[nobold]' \
+    "$MUTED" "$1" "$(gauge "$pct" "$HEAT" '#[fg=colour%s]')" "$(color "$pct")" "$pct"
   # A window that has already lapsed has nothing left to count down.
   if eta="$(countdown "$3")"; then
-    printf '#[fg=%s] ↻%s' "$MUTED" "$eta"
+    printf '#[fg=colour%s] ↻%s' "$MUTED" "$eta"
   fi
 }
 
@@ -92,7 +104,7 @@ render() {
   local five seven five_in seven_in
   read -r five seven five_in seven_in < <(read_usage) || return 0
   # fg=default, not default: the caller's background stays intact.
-  printf '#[fg=%s]✳ %s #[fg=%s]│ %s#[fg=default]' \
+  printf '#[fg=colour%s]✳ %s #[fg=colour%s]· %s#[fg=default]' \
     "$ACCENT" "$(segment 5h "$five" "$five_in")" \
     "$FAINT"  "$(segment 7d "$seven" "$seven_in")"
 }
@@ -106,8 +118,120 @@ status() {
   render
 }
 
+# What subagents that ran on a local (non-Claude) model would have cost on
+# Claude, read from Claude Code's transcripts. Counts sessions whose main agent
+# ran on Claude; each local subagent is priced as the Claude model it was asked
+# for, or the main agent's model when it named none, since that is where it
+# would otherwise have run.
+savings() {
+  local root="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects" now today subs aliases
+  # ERE has no lookahead: a "model" value that does not start with claude- or <synthetic>.
+  local not_claude='"model":"([^c<"]|c[^l]|cl[^a]|cla[^u]|clau[^d]|claud[^e]|claude[^-])'
+  now=$(date +%s)
+  today=$(( now - 10#$(date +%H) * 3600 - 10#$(date +%M) * 60 - 10#$(date +%S) ))
+
+  subs=$(find "$root" -path '*/subagents/*.jsonl' -print0 2>/dev/null |
+    xargs -0 grep -lE "$not_claude" 2>/dev/null || true)
+  if [ -z "$subs" ]; then
+    printf '\n  No subagents have run on a local model yet.\n\n'
+    return 0
+  fi
+
+  # The model each subagent was asked for, from its .meta.json.
+  aliases=$(while IFS= read -r f; do
+    jq -c --arg f "$f" '{($f): (.model // "inherit")}' "${f%.jsonl}.meta.json" 2>/dev/null ||
+      jq -nc --arg f "$f" '{($f): "inherit"}'
+  done <<< "$subs" | jq -sc 'add')
+
+  # Those subagent transcripts plus their sessions' main transcripts.
+  { printf '%s\n' "$subs"; printf '%s\n' "$subs" | sed 's|/subagents/.*|.jsonl|' | sort -u; } |
+    tr '\n' '\0' | xargs -0 jq -cR 'fromjson? | select(.type == "assistant" and .message.usage and .message.model and .timestamp)
+      | {f: input_filename, id: .message.id, ts: .timestamp, model: .message.model, u: .message.usage}' 2>/dev/null |
+    jq -rs --argjson aliases "$aliases" --argjson now "$now" --argjson today "$today" '
+      # USD per million tokens, Claude API list prices (2026-11). Cache writes
+      # cost 1.25x input for 5 minutes and 2x for an hour; local servers report
+      # no TTL, so their writes count at the cheaper 5-minute rate.
+      def rates: if test("haiku") then [0.1, 0.5, 0.01]
+                 elif test("sonnet") then [2, 10, 0.2]
+                 elif test("fable|mythos") then [10, 50, 0.25]
+                 else [4, 20, 0.2] end;
+      def cost($m): ($m | rates) as [$in, $out, $read]
+        | (.cache_creation.ephemeral_1h_input_tokens // 0) as $h
+        | ((.input_tokens // 0) * $in + ((.cache_creation_input_tokens // 0) - $h) * $in * 1.25
+           + $h * $in * 2 + (.cache_read_input_tokens // 0) * $read + (.output_tokens // 0) * $out) / 1e6;
+      def claude: test("^claude-");
+      def session: sub("/subagents/.*"; "") | sub("\\.jsonl$"; "");
+      def epoch: sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601;
+      def day: strflocaltime("%b %d");
+
+      # Streamed replies are logged once per content block with the same usage; keep one.
+      (group_by([.f, .id]) | map(last)) as $recs
+      | ($recs | map(select((.f | test("/subagents/") | not) and (.model | claude)))
+               | map({key: (.f | session), value: .model}) | from_entries) as $main
+      | [$recs[] | (.f | session) as $s | select($main[$s])
+         | {t: (.ts | epoch), f}
+           + if (.model | claude) then {spent: (.model as $m | .u | cost($m)), saved: 0}
+             else ($aliases[.f] // "inherit") as $a
+               | {saved: (.u | cost(if $a == "inherit" then $main[$s] else $a end)), spent: 0, local: true}
+             end] as $rows
+      | ((["Today", $today], ["7 days", $now - 7 * 86400], ["30 days", $now - 30 * 86400], ["All time", 0])
+         as [$label, $from]
+         | [$rows[] | select(.t >= $from)] as $r
+         | ["R", $label, ($r | map(.saved) | add // 0), ($r | map(.spent) | add // 0),
+            ($r | map(select(.local) | .f) | unique | length)] | @tsv),
+        ([range(13; -1; -1) | $now - . * 86400 | day] as $days
+         | ($rows | map(select(.local)) | group_by(.t | day)
+            | map({key: (.[0].t | day), value: (map(.saved) | add)}) | from_entries) as $by
+         | ([$days[] | $by[.] // 0] | max) as $max
+         | $days[] | ["D", ., ($by[.] // 0), (if $max > 0 then (($by[.] // 0) / $max * 8 | ceil) else 0 end)]
+         | @tsv)' | render_savings
+}
+
+# Rows from savings: R label saved spent subagents, then D day saved level,
+# where level 0-8 is the day's height in the sparkline.
+render_savings() {
+  local fg=$'\e[38;5;%sm' r=$'\e[0m' b=$'\e[1m' kind label saved spent n
+  local labels=() saveds=() spents=() counts=() days=() levels=() peak=0 peak_day=''
+  local glyphs=(▁ ▁ ▂ ▃ ▄ ▅ ▆ ▇ █) leaf i share spark=''
+  read -r -a leaf <<< "$LEAF"
+  while IFS=$'\t' read -r kind label saved spent n; do
+    if [ "$kind" = R ]; then
+      labels+=("$label"); saveds+=("$saved"); spents+=("$spent"); counts+=("$n")
+    else
+      days+=("$label"); levels+=("$spent")
+      if [ "$spent" -eq 8 ]; then peak=$saved; peak_day=$label; fi
+    fi
+  done
+  c() { printf "$fg" "$1"; }
+
+  printf '\n  %s⚡ %sLOCAL MODEL SAVINGS%s%*s%sat Claude API prices%s\n\n' \
+    "$(c "$ACCENT")" "$b" "$r" 9 '' "$(c "$MUTED")" "$r"
+  printf '  %s%s$%.2f%s %ssaved all time  ·  %s subagents ran locally%s\n\n' \
+    "$b" "$(c 114)" "${saveds[3]}" "$r" "$(c "$MUTED")" "${counts[3]}" "$r"
+
+  printf '  %s%-10s%8s%12s   %s%s\n' "$(c "$MUTED")" '' saved 'on Claude' 'local share' "$r"
+  for i in 0 1 2 3; do
+    share=$(awk -v s="${saveds[i]}" -v p="${spents[i]}" 'BEGIN { printf "%d", (s + p > 0) ? 100 * s / (s + p) : 0 }')
+    printf '  %-10s%s%s%8s%s%12s   %s %s%3d%%%s\n' "$(echo "${labels[i]}" | tr A-Z a-z)" \
+      "$b" "$(c 114)" "$(printf '$%.2f' "${saveds[i]}")" "$r" "$(printf '$%.2f' "${spents[i]}")" \
+      "$(gauge "$share" "$LEAF" "$fg")" "$(c "$MUTED")" "$share" "$r"
+  done
+
+  for i in "${!levels[@]}"; do
+    if [ "${levels[i]}" -gt 0 ]; then
+      spark+="$(c "${leaf[$(( levels[i] + 1 ))]}")${glyphs[levels[i]]}${glyphs[levels[i]]} "
+    else
+      spark+="$(c "$FAINT")▁▁ "
+    fi
+  done
+  printf '\n  %slast 14 days%s' "$(c "$MUTED")" "$r"
+  [ -n "$peak_day" ] && printf '%s  ·  best %s$%.2f%s %son %s%s' "$(c "$FAINT")" "$(c 114)" "$peak" "$r" "$(c "$MUTED")" "$peak_day" "$r"
+  printf '\n  %s%s\n  %s%-35s%s%s\n\n' "$spark" "$r" "$(c "$FAINT")" "${days[0]}" "${days[13]}" "$r"
+}
+
 case "${1:-status}" in
-  status) status ;;
-  fetch)  fetch && render && echo ;;
-  *) echo "usage: tmux-claude-usage [status|fetch]" >&2; exit 2 ;;
+  status)  status ;;
+  fetch)   fetch && render && echo ;;
+  savings) savings ;;
+  *) echo "usage: tmux-claude-usage [status|fetch|savings]" >&2; exit 2 ;;
 esac
